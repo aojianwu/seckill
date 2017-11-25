@@ -85,6 +85,7 @@ type SKUInfo struct {
 	StateName string // "现货" / "无货"
 	Name      string
 	Link      string
+	Attr      string
 }
 
 // JingDong wrap jing dong operation
@@ -634,6 +635,10 @@ func (jd *JingDong) OrderInfo() error {
 // SubmitOrder ... submit order to JingDong, return orderID or error
 //
 func (jd *JingDong) SubmitOrder() (string, error) {
+	if !jd.AutoSubmit {
+		return "", nil
+	}
+
 	logger.Infof(strSeperater)
 	logger.Infof("提交订单>")
 
@@ -799,8 +804,8 @@ func (jd *JingDong) stockState(ID string) (string, string, error) {
 
 // skuDetail get sku detail information
 //
-func (jd *JingDong) skuDetail(ID string) (*SKUInfo, error) {
-	g := &SKUInfo{ID: ID}
+func (jd *JingDong) skuDetail(ID string, count int) (*SKUInfo, error) {
+	sku := &SKUInfo{ID: ID, Count: count}
 
 	// response context encoding by GBK
 	//
@@ -820,26 +825,42 @@ func (jd *JingDong) skuDetail(ID string) (*SKUInfo, error) {
 	}
 
 	if link, exist := doc.Find("a#InitCartUrl").Attr("href"); exist {
-		g.Link = link
+		sku.Link = link
 		if !strings.HasPrefix(link, "https:") {
-			g.Link = "https:" + link
+			sku.Link = "https:" + link
 		}
 	}
 
 	dec := mahonia.NewDecoder("gbk")
 	//rd := dec.NewReader()
 
-	g.Name = strings.Trim(dec.ConvertString(doc.Find("div.sku-name").Text()), " \t\n")
-	g.Name = truncate(g.Name)
+	sku.Name = strings.Trim(dec.ConvertString(doc.Find("div.sku-name").Text()), " \t\n")
+	// g.Name = truncate(g.Name)
 
-	g.Price, _ = jd.getPrice(ID)
-	g.State, g.StateName, _ = jd.stockState(ID)
+	sku.Price, _ = jd.getPrice(ID)
+	sku.State, sku.StateName, _ = jd.stockState(ID)
+
+	if sku.Link == "" || sku.Count != 1 {
+		u, _ := url.Parse(URLAdd2Cart)
+		q := u.Query()
+		q.Set("pid", sku.ID)
+		q.Set("pcount", strconv.Itoa(sku.Count))
+		q.Set("ptype", "1")
+		u.RawQuery = q.Encode()
+		sku.Link = u.String()
+	}
+	logger.Infof("购买链接: %s", sku.Link)
+
+	if _, err := url.Parse(sku.Link); err != nil {
+		logger.Errorf("商品购买链接无效: <%s>", sku.Link)
+		// return fmt.Errorf("无效商品购买链接<%s>", sku.Link)
+	}
 
 	logger.Infof(strSeperater)
 	logger.Infof("商品详情>")
-	logger.Infof("编号: %s, 品名: %s, 库存: %s, 价格: %s, URL:%s", g.ID, g.Name, g.StateName, g.Price, g.Link)
+	logger.Infof("编号: %s, 品名: %s, 库存: %s, 价格: %s, URL:%s", sku.ID, sku.Name, sku.StateName, sku.Price, sku.Link)
 
-	return g, nil
+	return sku, nil
 }
 
 func (jd *JingDong) changeCount(ID string, count int) (int, error) {
@@ -868,49 +889,21 @@ func (jd *JingDong) changeCount(ID string, count int) (int, error) {
 	return js.Get("pcount").Int()
 }
 
-func (jd *JingDong) buyGood(sku *SKUInfo) error {
+func (jd *JingDong) addToCart(sku *SKUInfo) (bool, error) {
 	var (
 		err  error
 		data []byte
 		doc  *goquery.Document
 	)
 
-	// 33 : on sale
-	// 34 : out of stock
-	for sku.State != "33" && jd.AutoRush {
-		logger.Warnf("%s : %v, %s", sku.StateName, sku.ID, sku.Name)
-		time.Sleep(jd.Period)
-		sku.State, sku.StateName, err = jd.stockState(sku.ID)
-		if err != nil {
-			logger.Errorf("获取(%s)库存失败: %+v", sku.ID, err)
-			return err
-		}
-	}
-
-	if sku.Link == "" || sku.Count != 1 {
-		u, _ := url.Parse(URLAdd2Cart)
-		q := u.Query()
-		q.Set("pid", sku.ID)
-		q.Set("pcount", strconv.Itoa(sku.Count))
-		q.Set("ptype", "1")
-		u.RawQuery = q.Encode()
-		sku.Link = u.String()
-	}
-	logger.Infof("购买链接: %s", sku.Link)
-
-	if _, err := url.Parse(sku.Link); err != nil {
-		logger.Errorf("商品购买链接无效: <%s>", sku.Link)
-		return fmt.Errorf("无效商品购买链接<%s>", sku.Link)
-	}
-
 	if data, err = jd.getResponse("GET", sku.Link, nil); err != nil {
 		logger.Errorf("商品(%s)购买失败: %+v", sku.ID, err)
-		return err
+		return false, err
 	}
 
 	if doc, err = goquery.NewDocumentFromReader(bytes.NewBuffer(data)); err != nil {
 		logger.Errorf("响应解析失败: %+v", err)
-		return err
+		return false, err
 	}
 
 	succFlag := doc.Find("h3.ftx-02").Text()
@@ -928,25 +921,72 @@ func (jd *JingDong) buyGood(sku *SKUInfo) error {
 
 		if count > 0 {
 			logger.Infof("购买结果：成功加入进购物车 [%d] 个 [%s]", count, sku.Name)
-			return nil
+			return false, nil
 		}
 	}
 
-	return err
+	return false, err
+}
+
+func (jd *JingDong) buyGoods(sku *SKUInfo) error {
+	ret, err := jd.addToCart(sku)
+
+	if ret {
+		jd.CartDetails()
+		jd.OrderInfo()
+
+		jd.SubmitOrder()
+	} else {
+		if err != nil {
+			logger.Errorf("add to cart error:%v", err)
+		}
+	}
+
+	return nil
+}
+
+func (jd *JingDong) checkGoods(sku *SKUInfo) (ret bool, err error) {
+
+	if jd.AutoRush {
+		checkTimer := time.NewTimer(jd.Period)
+
+		for {
+			select {
+			case <-checkTimer.C:
+				sku.State, sku.StateName, err = jd.stockState(sku.ID)
+				if err != nil {
+					logger.Errorf("获取(%s)库存失败: %+v", sku.ID, err)
+				}
+				if sku.State == "33" {
+					ret = true
+					break
+				}
+				logger.Warnf("%s : %v, %s", sku.StateName, sku.ID, sku.Name)
+				checkTimer.Reset(jd.Period)
+			}
+
+		}
+
+	} else {
+		sku.State, sku.StateName, err = jd.stockState(sku.ID)
+	}
+
+	return ret, err
 }
 
 func (jd *JingDong) Buy(id string, count int) {
 	// for {
-	sku, err := jd.skuDetail(id)
+	sku, err := jd.skuDetail(id, count)
 	if err == nil {
 		sku.Count = count
-		jd.buyGood(sku)
+		ret, err := jd.checkGoods(sku)
+		if ret {
+			jd.buyGoods(sku)
 
-		jd.CartDetails()
-		jd.OrderInfo()
-
-		if jd.AutoSubmit {
-			jd.SubmitOrder()
+		} else {
+			if err != nil {
+				logger.Errorf("check goods failed.err:%+v", err)
+			}
 		}
 
 		// break
